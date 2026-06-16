@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # RSS Monitor 服务安装与管理脚本
-# V3.0 增强版：完美解决 CF 拦截、PushPlus 业务防漏报、以及【顶贴/重启重复推送】问题
+# V3.1 修复版：自动创建补全目录，解决精简版系统缺少目录导致安装中断的问题
 #
 
 set -euo pipefail
@@ -589,6 +589,8 @@ EOF
 
 setup_shell_integration() {
     info "=== [7/9] 配置 Shell 自动补全与快捷别名 ==="
+    # 核心修复点：确保自动补全脚本存放目录存在，防止精简系统报错
+    mkdir -p "${BASH_COMPLETION_DIR}"
     cat > "${BASH_COMPLETION_DIR}/rssctl" <<'EOF'
 _rssctl_completion() {
     local cur prev
