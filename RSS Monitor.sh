@@ -1,17 +1,12 @@
 #!/bin/bash
 #
 # RSS Monitor 服务安装与管理脚本
-# 经过错误修正与全面优化，增强了安全性、健壮性和用户体验
+# V3.0 增强版：完美解决 CF 拦截、PushPlus 业务防漏报、以及【顶贴/重启重复推送】问题
 #
 
-# --- 脚本设置 ---
-# set -e: 当任何命令返回非零退出码时立即退出
-# set -u: 将任何未设置的变量视为错误
-# set -o pipefail: 如果管道中的任何命令失败，则整个管道的返回值均为失败
 set -euo pipefail
 
 # --- 全局常量与配置 ---
-# 使用大写只读变量来定义全局常量，这是一种良好的编程实践
 readonly SERVICE="rss_monitor"
 readonly INSTALL_DIR="/opt/${SERVICE}"
 readonly VENV_DIR="${INSTALL_DIR}/venv"
@@ -24,14 +19,11 @@ readonly MONITOR_SCRIPT="${INSTALL_DIR}/rss_monitor.py"
 readonly UNINSTALLER_SCRIPT="${INSTALL_DIR}/uninstall.sh"
 
 # --- 辅助函数 ---
-# 封装日志函数，使输出更清晰、更统一
 info() { echo -e "\033[32m[信息]\033[0m $1"; }
 warn() { echo -e "\033[33m[警告]\033[0m $1" >&2; }
 error() { echo -e "\033[31m[错误]\033[0m $1" >&2; exit 1; }
 
-# 检查脚本是否以 root 权限运行
 check_root() {
-    # ${EUID} 是一个环境变量，代表有效用户ID。0 代表 root 用户。
     if [[ "${EUID}" -ne 0 ]]; then
         error "此脚本必须以 root 权限 (sudo) 运行。"
     fi
@@ -41,7 +33,6 @@ check_root() {
 
 install_dependencies() {
     info "=== [1/9] 安装系统依赖 ==="
-    # 使用 apt-get -qq 选项来减少不必要的输出，让安装过程更整洁
     if ! apt-get update -qq 2>/dev/null || ! apt-get install -y -qq python3 python3-pip python3-venv bash-completion >/dev/null 2>&1; then
         error "依赖安装失败。请尝试手动运行 'apt-get update' 后重试。"
     fi
@@ -49,8 +40,6 @@ install_dependencies() {
 
 setup_directories_and_venv() {
     info "=== [2/9] 配置程序目录与 Python 虚拟环境 ==="
-    # 【安全修复】创建一个专用的系统用户来运行服务。
-    # 这个用户没有 shell 登录权限 (-s /bin/false)，也无法作为普通用户登录。
     if ! id -u "${SERVICE}" &>/dev/null; then
         info "创建专用的系统用户 '${SERVICE}'..."
         useradd -r -s /bin/false -d "${INSTALL_DIR}" "${SERVICE}"
@@ -62,28 +51,30 @@ setup_directories_and_venv() {
     python3 -m venv "${VENV_DIR}"
 
     info "安装 Python 依赖库 (requests, feedparser)..."
-    # 将依赖安装到虚拟环境中，避免污染全局 Python 环境。
     if ! "${VENV_DIR}/bin/pip" install -q --upgrade pip || \
        ! "${VENV_DIR}/bin/pip" install -q "requests[security]" feedparser; then
         error "在虚拟环境中安装 Python 依赖失败。"
     fi
     
-    # 【安全修复】将整个程序目录的所有权交给新创建的服务用户
     chown -R "${SERVICE}:${SERVICE}" "${INSTALL_DIR}"
 }
 
 create_config_file() {
     info "=== [3/9] 写入示例配置文件 ==="
-    cat > "${CONFIG_FILE}" <<EOF
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        cat > "${CONFIG_FILE}" <<EOF
 {
   "interval": 15,
   "keywords": ["AI", "ChatGPT", "开源"],
   "pushplus_token": "请在这里填写你的pushplus token"
 }
 EOF
-    chown "${SERVICE}:${SERVICE}" "${CONFIG_FILE}"
-    info "配置文件已创建于: ${CONFIG_FILE}"
-    warn "请记得修改配置文件，填入你自己的 PushPlus Token！"
+        chown "${SERVICE}:${SERVICE}" "${CONFIG_FILE}"
+        info "配置文件已创建于: ${CONFIG_FILE}"
+        warn "请记得修改配置文件，填入你自己的 PushPlus Token！"
+    else
+        info "配置文件已存在，跳过创建以保留原有配置。"
+    fi
 }
 
 create_monitor_script() {
@@ -98,24 +89,25 @@ import signal
 import requests
 import feedparser
 import sys
+import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --- 全局常量 ---
 CONFIG_FILE = "/opt/rss_monitor/config.json"
+CACHE_FILE = "/opt/rss_monitor/seen_ids.json"
 RSS_URL = "https://rss.nodeseek.com"
+MAX_CACHE_SIZE = 1000
 
 # --- 全局状态变量 ---
 running = True
 reload_config_flag = False
 
 def log(message):
-    """将日志信息打印到标准输出,由 systemd 统一管理"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     print(f"[{timestamp}] {message}", flush=True)
 
 def load_config():
-    """加载并返回 JSON 配置文件内容"""
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -123,13 +115,38 @@ def load_config():
         log(f"错误：无法加载或解析配置文件: {e}")
         return None
 
+def extract_post_id(link):
+    """从 NodeSeek 链接中精准提取唯一的帖子数字 ID，彻底防止顶贴和翻页导致的重复推送"""
+    match = re.search(r'post-(\d+)', link)
+    if match:
+        return match.group(1)
+    return link  # 如果解析失败，降级退回到使用完整链接字符串
+
+def load_seen_ids():
+    """从本地文件加载已推送的帖子 ID 历史"""
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            log(f"警告：无法加载持久化去重缓存: {e}")
+    return []
+
+def save_seen_ids(ids_list):
+    """将已推送的帖子 ID 历史保存到本地文件"""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(ids_list, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"错误：保存去重缓存文件失败: {e}")
+
 def send_pushplus(token, title, content):
-    """通过 PushPlus 发送通知 (增加了HTTPS和重试机制)"""
     if not token or token == "请在这里填写你的pushplus token":
         log("警告：PushPlus token 未配置，跳过发送。")
         return
 
-    # 【修复1】改用 HTTPS 协议
     url = "https://www.pushplus.plus/send"
     data = {
         "token": token,
@@ -138,26 +155,29 @@ def send_pushplus(token, title, content):
         "template": "markdown",
     }
 
-    # 【修复2】设置重试策略，应对网络波动
     session = requests.Session()
     retry_strategy = Retry(
-        total=3,  # 总共重试3次
-        status_forcelist=[429, 500, 502, 503, 504], # 对这些服务器错误状态码也进行重试
+        total=3,
+        status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["POST"],
-        backoff_factor=1  # 每次重试的等待时间会增加 (例如: 1s, 2s, 4s)
+        backoff_factor=1
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
 
     try:
-        # 使用 session 发送请求，并保持15秒的单次连接超时
         response = session.post(url, json=data, timeout=15)
-        response.raise_for_status() # 如果发生4xx或5xx错误，则抛出异常
-        log(f"成功发送通知: {title}")
+        response.raise_for_status() 
+        
+        result = response.json()
+        if result.get("code") == 200:
+            log(f"成功发送通知: {title}")
+        else:
+            log(f"错误：PushPlus 拒绝发送。错误码: {result.get('code')}, 原因: {result.get('msg', '未知')}")
+            
     except requests.exceptions.RequestException as e:
-        log(f"错误：PushPlus 通知发送失败 (已重试3次): {e}")
-        log("排查建议: 1. 检查服务器能否访问外网。 2. 检查服务器防火墙或云服务商安全组是否允许出站HTTPS(443)流量。 3. 在服务器上执行 'curl -v https://www.pushplus.plus/send' 进行测试。")
+        log(f"错误：PushPlus 通知网络发送失败 (已重试3次): {e}")
 
 def sigterm_handler(signum, frame):
     global running
@@ -181,7 +201,12 @@ def main():
         log("错误：启动时无法加载配置，服务退出。")
         sys.exit(1)
         
-    seen_links = set()
+    # 初始化去重缓存（结合内存 Set 和持久化 List）
+    seen_ids_list = load_seen_ids()
+    seen_ids = set(seen_ids_list)
+    
+    if seen_ids:
+        log(f"成功从本地文件载入 {len(seen_ids)} 条历史去重记录。")
 
     while running:
         try:
@@ -194,22 +219,46 @@ def main():
                     log("警告：尝试重载配置失败，继续使用旧配置。")
                 reload_config_flag = False
 
-            feed = feedparser.parse(RSS_URL)
+            # 伪装 Header 绕过 Cloudflare
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            try:
+                rss_resp = requests.get(RSS_URL, headers=headers, timeout=15)
+                rss_resp.raise_for_status()
+                feed = feedparser.parse(rss_resp.text)
+            except Exception as e:
+                log(f"错误：获取或解析 RSS 源失败 (可能是CF拦截或网络问题): {e}")
+                time.sleep(60)
+                continue
+
             if feed.bozo:
-                log(f"警告：RSS feed 解析可能存在问题: {feed.bozo_exception}")
+                log(f"警告：RSS feed 解析可能存在格式问题: {feed.bozo_exception}")
 
             keywords = {kw.lower() for kw in config.get("keywords", [])}
+            has_new_data = False
 
             for entry in reversed(feed.entries):
-                if entry.link not in seen_links:
-                    seen_links.add(entry.link)
-                    entry_title_lower = entry.title.lower()
+                post_id = extract_post_id(entry.link)
+                
+                if post_id not in seen_ids:
+                    seen_ids.add(post_id)
+                    seen_ids_list.append(post_id)
+                    has_new_data = True
                     
+                    entry_title_lower = entry.title.lower()
                     if any(kw in entry_title_lower for kw in keywords):
-                        log(f"发现关键词匹配: '{entry.title}'")
+                        log(f"发现关键词匹配: '{entry.title}' (帖子ID: {post_id})")
                         summary_text = entry.get("summary", "(无摘要)")
                         content = f"**摘要**: {summary_text[:150]}...\n\n[点击查看原文]({entry.link})"
                         send_pushplus(config.get("pushplus_token"), entry.title, content)
+            
+            # 定期维护缓存文件大小
+            if has_new_data:
+                if len(seen_ids_list) > MAX_CACHE_SIZE:
+                    seen_ids_list = seen_ids_list[-MAX_CACHE_SIZE:]
+                    seen_ids = set(seen_ids_list)
+                save_seen_ids(seen_ids_list)
             
             time.sleep(config.get("interval", 15))
 
@@ -241,7 +290,6 @@ CONFIG_FILE = f"/opt/{SERVICE_NAME_CONST}/config.json"
 UNINSTALLER_SCRIPT = f"/opt/{SERVICE_NAME_CONST}/uninstall.sh"
 SERVICE_FILE = f"{SERVICE_NAME_CONST}.service"
 
-# --- 颜色常量 ---
 class C:
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
@@ -249,7 +297,6 @@ class C:
     RESET = "\033[0m"
 
 def run_system_command(command, **kwargs):
-    """安全地执行一个系统命令"""
     try:
         result = subprocess.run(command, check=True, text=True, capture_output=True, **kwargs)
         return result.stdout.strip()
@@ -262,13 +309,11 @@ def run_system_command(command, **kwargs):
         sys.exit(1)
 
 def reload_service():
-    """通知 systemd 服务重载配置"""
     print("正在通知服务重新加载配置...")
     run_system_command(["systemctl", "kill", "-s", "HUP", SERVICE_FILE])
     print(f"{C.GREEN}服务已收到重载指令。{C.RESET}")
 
 def load_config():
-    """加载 JSON 配置文件"""
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -280,7 +325,6 @@ def load_config():
         sys.exit(1)
 
 def save_config(cfg):
-    """保存配置到 JSON 文件"""
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -289,7 +333,6 @@ def save_config(cfg):
         sys.exit(1)
 
 def list_keywords(cfg):
-    """列出带编号的关键词列表"""
     keywords = sorted(cfg.get("keywords", []))
     if not keywords:
         print(f"{C.YELLOW}当前没有配置任何关键词。{C.RESET}")
@@ -300,7 +343,6 @@ def list_keywords(cfg):
     return keywords
 
 def add_keyword(cfg, keyword):
-    """为命令行非交互模式保留的单个添加功能"""
     keywords = set(cfg.get("keywords", []))
     if keyword in keywords:
         print(f"{C.YELLOW}关键词 '{keyword}' 已存在。{C.RESET}")
@@ -312,7 +354,6 @@ def add_keyword(cfg, keyword):
     reload_service()
 
 def add_keywords(cfg, keywords_to_add):
-    """批量添加关键词"""
     current_keywords = set(cfg.get("keywords", []))
     added, existed = [], []
     for kw in keywords_to_add:
@@ -332,7 +373,6 @@ def add_keywords(cfg, keywords_to_add):
         print(f"{C.YELLOW}下列 {len(existed)} 个关键词已存在，已跳过: {', '.join(existed)}{C.RESET}")
 
 def remove_keyword(cfg, keyword):
-    """为命令行非交互模式保留的单个删除功能"""
     keywords = cfg.get("keywords", [])
     if keyword not in keywords:
         print(f"{C.YELLOW}关键词 '{keyword}' 不存在。{C.RESET}")
@@ -344,7 +384,6 @@ def remove_keyword(cfg, keyword):
     reload_service()
 
 def remove_keywords(cfg, keywords_to_remove):
-    """批量删除关键词"""
     current_keywords = set(cfg.get("keywords", []))
     removed_set = current_keywords.intersection(set(keywords_to_remove))
     current_keywords.difference_update(removed_set)
@@ -366,7 +405,6 @@ def set_token(cfg, token):
     reload_service()
 
 def set_interval(cfg, interval_str):
-    """设置检索时间间隔"""
     try:
         interval = int(interval_str)
         if interval < 10:
@@ -380,7 +418,6 @@ def set_interval(cfg, interval_str):
         print(f"\n{C.RED}[错误]{C.RESET} 输入无效，请输入一个纯数字。")
 
 def uninstall_service():
-    """处理卸载逻辑"""
     if os.geteuid() != 0:
         print(f"{C.RED}[错误]{C.RESET} 卸载操作需要 root 权限。")
         print(f"{C.YELLOW}请使用 'sudo rkm' 或 'sudo rssctl menu' 再次运行此命令。{C.RESET}")
@@ -403,7 +440,6 @@ def uninstall_service():
         print(f"\n{C.YELLOW}操作已取消。{C.RESET}")
 
 def show_menu():
-    """显示交互式管理菜单"""
     while True:
         print(f"\n{C.GREEN}=== RSS Monitor 服务管理菜单 ===")
         print("1. 查看关键词列表")
@@ -532,14 +568,12 @@ After=network.target
 
 [Service]
 Type=simple
-# 【安全修复】指定服务以我们创建的低权限用户运行
 User=${SERVICE}
 Group=${SERVICE}
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${VENV_DIR}/bin/python3 ${MONITOR_SCRIPT}
 Restart=always
 RestartSec=10
-# 【健壮性改进】将日志重定向到 systemd journald，方便管理
 StandardOutput=journal
 StandardError=journal
 
@@ -565,7 +599,6 @@ _rssctl_completion() {
         return 0
     fi
     if [[ ${prev} == "remove-keyword" ]]; then
-        # 在非交互模式下，补全是基于关键词名称的
         local keywords=$(rssctl list-keywords 2>/dev/null | grep -E '^\s+[0-9]+\.' | sed -E 's/^\s+[0-9]+\. //')
         COMPREPLY=( $(compgen -W "${keywords}" -- "${cur}") )
     fi
@@ -590,7 +623,6 @@ alias rkr='rssctl remove-keyword'
 alias rkm='rssctl menu'
 EOF
 )
-    # 遍历当前用户和 root 用户的主目录，为 bash 和 zsh 添加别名
     for homedir in "/root" "${HOME:-/root}"; do
         for rc_file in "${homedir}/.bashrc" "${homedir}/.zshrc"; do
             if [ -f "${rc_file}" ] && ! grep -q "# RSS Monitor 快捷别名" "${rc_file}"; then
@@ -603,7 +635,6 @@ EOF
 
 backup_uninstaller() {
     info "=== [9/9] 备份卸载程序以便管理 ==="
-    # 将此脚本自身复制到安装目录，以便 rssctl 可以调用它来卸载
     cp "$0" "${UNINSTALLER_SCRIPT}"
     chmod +x "${UNINSTALLER_SCRIPT}"
 }
@@ -611,7 +642,7 @@ backup_uninstaller() {
 # --- 完整安装流程 ---
 install_all() {
     check_root
-    info "开始安装 RSS Monitor 服务..."
+    info "开始安装/更新 RSS Monitor 服务..."
     
     install_dependencies
     setup_directories_and_venv
@@ -622,16 +653,18 @@ install_all() {
     setup_shell_integration
     backup_uninstaller
     
+    # 修正可能存在的文件所有权（针对覆盖升级场景）
+    chown -R "${SERVICE}:${SERVICE}" "${INSTALL_DIR}"
+
     info "=========================================="
-    info "🎉 RSS Monitor 安装完成！"
+    info "🎉 RSS Monitor 升级/安装完成！"
     info "=========================================="
     echo ""
-    info "请执行 'source ~/.bashrc' 或 'source ~/.zshrc' 来让快捷别名生效，或重新打开终端。"
+    info "请执行 'source ~/.bashrc' 或 'source ~/.zshrc' 让别名生效（如已配置可无视）。"
     echo ""
-    info "常用命令:"
-    info "  rkm                   - 显示交互式管理菜单 (推荐)"
-    info "  systemctl status ${SERVICE} - 查看服务运行状态"
-    info "  journalctl -u ${SERVICE} -f - 查看实时日志"
+    info "常用管理指令:"
+    info "  rk 或 rkm              - 进入交互式管理菜单"
+    info "  journalctl -u ${SERVICE} -f - 查看实时过滤与持久化载入日志"
     echo ""
     
     "${BIN_FILE}" menu
@@ -641,10 +674,9 @@ install_all() {
 uninstall_all() {
     check_root
     warn "即将彻底卸载 RSS Monitor 服务！"
-    # 在非交互式卸载时，也需要确认
-    if [[ $- == *i* ]]; then # 检查是否在交互式 shell 中
-        read -p "这将删除所有配置文件、脚本和专用用户，确定要继续吗？(y/N): " choice
-        if [[ "${choice,,}" != "y" ]]; then # 转换为小写比较
+    if [[ $- == *i* ]]; then
+        read -p "这将删除所有配置文件、去重缓存、脚本和专用用户，确定要继续吗？(y/N): " choice
+        if [[ "${choice,,}" != "y" ]]; then
             info "操作已取消。"
             exit 0
         fi
@@ -666,7 +698,6 @@ uninstall_all() {
     for homedir in "/root" "${HOME:-/root}"; do
         for rc_file in "${homedir}/.bashrc" "${homedir}/.zshrc"; do
             if [ -f "${rc_file}" ]; then
-                # 使用 sed 命令来删除我们之前添加的别名区块
                 sed -i '/# RSS Monitor 快捷别名/,+5d' "${rc_file}"
             fi
         done
@@ -706,5 +737,4 @@ main() {
     esac
 }
 
-# 执行主函数，并将所有参数传递给它
 main "$@"
